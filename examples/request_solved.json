@@ -1,0 +1,14 @@
+{
+  "predictions": [
+    {"id": 1, "box": [0, 0, 20, 20], "score": 0.90},
+    {"id": 2, "box": [6, 0, 26, 20], "score": 0.85},
+    {"id": 3, "box": [100, 100, 120, 120], "score": 0.40}
+  ],
+  "ground_truths": [
+    {"id": 101, "box": [0, 0, 20, 20]},
+    {"id": 102, "box": [6, 0, 26, 20]}
+  ],
+  "target_gt_ids": [102],
+  "iou_threshold": 0.5,
+  "exemptible_pairs": [[1, 2]]
+}

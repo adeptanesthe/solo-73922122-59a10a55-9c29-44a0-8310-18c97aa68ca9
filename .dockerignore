@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+tests
+examples
+README.md
+pyproject.toml
+requirements-dev.txt
+docker-compose.yml
+.dockerignore
+.gitignore
