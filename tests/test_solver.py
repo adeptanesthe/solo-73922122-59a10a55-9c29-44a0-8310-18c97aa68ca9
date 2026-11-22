@@ -7,6 +7,7 @@ from app.solver import (
     EvalResult,
     GroundTruth,
     Prediction,
+    attribute,
     evaluate,
     iou,
     is_feasible,
@@ -220,3 +221,123 @@ def test_is_feasible_fp_guard():
     assert is_feasible(res, required_hits={10}, max_fp=1)
     assert not is_feasible(res, required_hits={10}, max_fp=0)   # 误报增加 → 不可行
     assert not is_feasible(res, required_hits={10, 11}, max_fp=1)  # 命中缺失 → 不可行
+
+
+# ---------------- 版本归因 ----------------
+
+def test_attribution_nms_suppressed_cause():
+    """升级版新增高置信框抑制了目标候选框，且抑制者本身不覆盖目标 → NMS 原因。"""
+    gts = [G(101, (50, 50, 70, 70)), G(102, (0, 0, 10, 10))]
+    base = [P(1, (50, 50, 70, 70), 0.9), P(2, (0, 0, 10, 20), 0.8)]
+    up = base + [P(9, (0, 9, 10, 20), 0.95)]
+    res = attribute(gts, [101, 102], 0.5, base, up)
+    by_id = {t.gt_id: t for t in res.targets}
+    assert by_id[101].change == "unchanged"       # 基线已命中且升级版仍命中
+    assert by_id[101].cause is None
+    t = by_id[102]
+    assert t.change == "hit_to_missed"
+    assert t.cause.type == "nms_suppressed"
+    assert t.cause.version == "upgraded"
+    assert t.cause.prediction_ids == [2]
+    assert t.cause.suppressed_by_prediction_ids == [9]
+    assert t.cause.competing_gt_ids == []
+    assert [c.prediction_id for c in t.upgraded.candidates] == [2]
+    assert t.upgraded.candidates[0].nms_status == "suppressed"
+    assert t.upgraded.candidates[0].suppressed_by_prediction_id == 9
+    assert t.upgraded.candidates[0].suppression_iou is not None
+    assert t.upgraded.matched_prediction_id is None
+
+
+def test_attribution_gt_competition_cause():
+    """目标候选框被保留，但贪心匹配中先配给了另一个真值 → 竞争原因。"""
+    gts = [G(101, (0, 0, 20, 20)), G(102, (10, 0, 30, 20))]
+    base = [P(1, (0, 0, 20, 20), 0.9), P(3, (10, 0, 30, 20), 0.8)]
+    up = [P(2, (5, 0, 25, 20), 0.95)]   # 与两真值 IoU 相同，按小编号先配 101
+    res = attribute(gts, [101, 102], 0.5, base, up)
+    t = {x.gt_id: x for x in res.targets}[102]
+    assert t.change == "hit_to_missed"
+    assert t.cause.type == "gt_competition"
+    assert t.cause.version == "upgraded"
+    assert t.cause.prediction_ids == [2]
+    assert t.cause.competing_gt_ids == [101]
+    assert t.upgraded.candidates[0].nms_status == "kept"
+    assert t.upgraded.candidates[0].matched_gt_id == 101
+
+
+def test_attribution_no_coverage_cause():
+    """升级版没有任何框覆盖目标真值 → 无覆盖原因。"""
+    gts = [G(101, (0, 0, 20, 20)), G(103, (100, 100, 120, 120))]
+    base = [P(1, (0, 0, 20, 20), 0.9), P(4, (100, 100, 120, 120), 0.7)]
+    up = [P(1, (0, 0, 20, 20), 0.9)]
+    res = attribute(gts, [101, 103], 0.5, base, up)
+    t = {x.gt_id: x for x in res.targets}[103]
+    assert t.change == "hit_to_missed"
+    assert t.cause.type == "no_coverage"
+    assert t.cause.prediction_ids == []
+    assert t.upgraded.candidates == []
+    # 最近框（IoU 低于 0.5 也算）应为框 1
+    assert t.cause.nearest_prediction_id == 1
+    assert t.cause.nearest_iou == pytest.approx(0.0)
+
+
+def test_attribution_missed_to_hit_replays_baseline_cause():
+    """漏检被找回时，原因取自基线版重放。"""
+    gts = [G(101, (50, 50, 70, 70)), G(102, (0, 0, 10, 10))]
+    base = [P(1, (50, 50, 70, 70), 0.9), P(2, (0, 0, 10, 20), 0.8),
+            P(9, (0, 9, 10, 20), 0.95)]
+    up = [P(1, (50, 50, 70, 70), 0.9), P(2, (0, 0, 10, 20), 0.8)]
+    res = attribute(gts, [102], 0.5, base, up)
+    t = res.targets[0]
+    assert t.change == "missed_to_hit"
+    assert t.cause.type == "nms_suppressed"
+    assert t.cause.version == "baseline"
+    assert t.cause.prediction_ids == [2]
+    assert t.cause.suppressed_by_prediction_ids == [9]
+
+
+def test_attribution_kept_candidate_matched_to_other_gt_field():
+    """保留候选框配到其他真值时，明细里应给出 matched_gt_id。"""
+    gts = [G(101, (0, 0, 20, 20)), G(102, (10, 0, 30, 20))]
+    base = [P(1, (0, 0, 20, 20), 0.9), P(3, (10, 0, 30, 20), 0.8)]
+    up = [P(2, (5, 0, 25, 20), 0.95)]
+    res = attribute(gts, [102], 0.5, base, up)
+    cand = res.targets[0].upgraded.candidates[0]
+    assert cand.nms_status == "kept"
+    assert cand.suppressed_by_prediction_id is None
+    assert cand.suppression_iou is None
+    assert cand.matched_gt_id == 101
+
+
+def test_attribution_unchanged_has_no_cause():
+    gts = [G(1, (0, 0, 10, 10))]
+    preds = [P(1, (0, 0, 10, 10), 0.9)]
+    res = attribute(gts, [1], 0.5, preds, preds)
+    t = res.targets[0]
+    assert t.changed is False
+    assert t.change == "unchanged"
+    assert t.cause is None
+    assert t.baseline.status == t.upgraded.status == "hit"
+
+
+def test_attribution_strict_threshold_matches_review_rules():
+    """IoU 恰好等于阈值时不抑制；两版结果应一致。"""
+    gts = [G(1, (0, 0, 2, 2))]
+    base = [P(1, (0, 0, 2, 2), 0.9)]
+    up = [P(1, (0, 0, 2, 2), 0.9), P(2, (1, 0, 2, 2), 0.8)]  # IoU 恰为 0.5
+    res = attribute(gts, [1], 0.5, base, up)
+    assert res.upgraded.suppressed == []
+    assert res.upgraded.kept_ids == [1, 2]
+    assert res.targets[0].change == "unchanged"
+
+
+def test_attribution_shared_gt_and_threshold_across_versions():
+    """两版必须使用同一真值集合与阈值；返回两版整体明细。"""
+    gts = [G(1, (0, 0, 10, 10)), G(2, (100, 100, 110, 110))]
+    base = [P(1, (0, 0, 10, 10), 0.9)]
+    up = [P(1, (0, 0, 10, 10), 0.9), P(2, (100, 100, 110, 110), 0.8)]
+    res = attribute(gts, [1, 2], 0.5, base, up)
+    assert res.baseline.missed_gt_ids == [2]
+    assert res.upgraded.missed_gt_ids == []
+    assert {t.gt_id: t.change for t in res.targets} == {1: "unchanged", 2: "missed_to_hit"}
+    assert res.targets[0].gt_id == 1  # 按真值编号升序
+

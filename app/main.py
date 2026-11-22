@@ -5,20 +5,27 @@ from fastapi import FastAPI
 
 from . import solver
 from .models import (
+    AttributionRequest,
+    AttributionResponse,
+    CandidateStateOut,
+    CauseOut,
     MatchOut,
     MatchReportOut,
     ReviewRequest,
     ReviewResponse,
     SuppressionOut,
+    TargetAttributionOut,
+    TargetVersionStateOut,
 )
 
 app = FastAPI(
     title="釉面缺陷漏检复核 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "针对相邻釉面缺陷在 NMS 后只剩一个框的漏检问题："
         "在抑制前预测框上重放贪心 NMS 与匹配，"
-        "搜索找回指定漏检真值所需的最少豁免框对。"
+        "搜索找回指定漏检真值所需的最少豁免框对；"
+        "并可按版本归因，区分漏检源自 NMS 抑制、真值竞争或无覆盖。"
     ),
 )
 
@@ -87,4 +94,86 @@ def review(req: ReviewRequest) -> ReviewResponse:
             if result.all_exempted is not None
             else None
         ),
+    )
+
+
+def _version_state(state: solver.TargetVersionState) -> TargetVersionStateOut:
+    return TargetVersionStateOut(
+        status=state.status,
+        matched_prediction_id=state.matched_prediction_id,
+        candidates=[
+            CandidateStateOut(
+                prediction_id=c.prediction_id,
+                iou=round(c.iou, 6),
+                nms_status=c.nms_status,
+                suppressed_by_prediction_id=c.suppressed_by_prediction_id,
+                suppression_iou=(
+                    round(c.suppression_iou, 6)
+                    if c.suppression_iou is not None else None
+                ),
+                matched_gt_id=c.matched_gt_id,
+            )
+            for c in state.candidates
+        ],
+    )
+
+
+@app.post(
+    "/api/v1/review/attribution",
+    response_model=AttributionResponse,
+    summary="版本归因：重放两版 NMS+匹配，逐目标区分漏检原因",
+)
+def attribution(req: AttributionRequest) -> AttributionResponse:
+    gts = [solver.GroundTruth(id=g.id, box=tuple(g.box)) for g in req.ground_truths]
+
+    def to_preds(items):
+        return [
+            solver.Prediction(id=p.id, box=tuple(p.box), score=p.score) for p in items
+        ]
+
+    result = solver.attribute(
+        gts=gts,
+        target_gt_ids=req.target_gt_ids,
+        iou_threshold=req.iou_threshold,
+        baseline_preds=to_preds(req.baseline_predictions),
+        upgraded_preds=to_preds(req.upgraded_predictions),
+    )
+
+    targets = set(req.target_gt_ids)
+    hit_to_missed = sorted(t.gt_id for t in result.targets if t.change == "hit_to_missed")
+    missed_to_hit = sorted(t.gt_id for t in result.targets if t.change == "missed_to_hit")
+
+    return AttributionResponse(
+        targets=[
+            TargetAttributionOut(
+                gt_id=t.gt_id,
+                changed=t.changed,
+                change=t.change,
+                baseline=_version_state(t.baseline),
+                upgraded=_version_state(t.upgraded),
+                cause=(
+                    CauseOut(
+                        type=t.cause.type,
+                        version=t.cause.version,
+                        prediction_ids=t.cause.prediction_ids,
+                        suppressed_by_prediction_ids=(
+                            t.cause.suppressed_by_prediction_ids),
+                        competing_gt_ids=t.cause.competing_gt_ids,
+                        nearest_prediction_id=t.cause.nearest_prediction_id,
+                        nearest_iou=(
+                            round(t.cause.nearest_iou, 6)
+                            if t.cause.nearest_iou is not None else None
+                        ),
+                        description=t.cause.description,
+                    )
+                    if t.cause is not None else None
+                ),
+            )
+            for t in result.targets
+        ],
+        changed_target_count=len(hit_to_missed) + len(missed_to_hit),
+        hit_to_missed_gt_ids=hit_to_missed,
+        missed_to_hit_gt_ids=missed_to_hit,
+        baseline=_report(result.baseline, targets),
+        upgraded=_report(result.upgraded, targets),
     )

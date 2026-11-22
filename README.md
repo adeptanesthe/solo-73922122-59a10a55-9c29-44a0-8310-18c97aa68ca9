@@ -23,7 +23,8 @@
 
 ## 限制
 
-- 预测框、真值框各至多 **60** 个；可豁免候选框对至多 **10** 对。
+- `/review`：预测框、真值框各至多 **60** 个；可豁免候选框对至多 **10** 对。
+- `/review/attribution`：两版预测框各至多 **120** 个，真值至多 **120** 个。
 - 框格式 `[x1, y1, x2, y2]`，要求 `x2>x1`、`y2>y1`；置信度 ∈ [0, 1]；
   `iou_threshold` ∈ [0, 1]；编号在同一张图内唯一（非负整数）。
 
@@ -115,13 +116,86 @@ curl -sS -X POST http://localhost:8000/api/v1/review \
 ./examples/call_api.sh http://localhost:8000 examples/request_infeasible.json   # 场景二
 ```
 
+### `POST /api/v1/review/attribution`
+
+版本归因：同一张照片共享一份真值、一个 `iou_threshold` 和一套编号规则，分别对
+**基线版**与**升级版**抑制前的预测框重放与 `/review` 完全相同的贪心 NMS + 匹配
+（无豁免、阈值严格大于才抑制、匹配下限 0.5 含等号、分数并列取小编号），再逐目标
+对比两版状态并给出漏检原因。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `ground_truths` | array | 两版共享的真值框 `[{id, box}]`，≤120 |
+| `iou_threshold` | float | 两版共享的 NMS 抑制阈值，∈ [0, 1] |
+| `target_gt_ids` | int[] | 需要逐目标归因的真值编号，至少 1 个，≤120 |
+| `baseline_predictions` | array | 基线版抑制前预测框 `[{id, box, score}]`，≤120 |
+| `upgraded_predictions` | array | 升级版抑制前预测框 `[{id, box, score}]`，≤120 |
+
+框格式、`score` 取值、编号唯一性等约束与 `/review` 相同，不合法请求返回 422。
+
+响应对每个目标给出：
+
+- `baseline` / `upgraded`: 该真值在两版中的 `status`（`hit` / `missed`）、
+  命中它的 `matched_prediction_id`，以及所有 IoU ≥ 0.5 的 `candidates`。
+  每个候选框给出 `prediction_id`、与该真值的 `iou`、`nms_status`
+  （`kept` / `suppressed`）、`suppressed_by_prediction_id` 与 `suppression_iou`、
+  以及保留框最终配上的 `matched_gt_id`（保留但配给别的真值时可见）。
+- `change`: `unchanged` / `hit_to_missed` / `missed_to_hit`。
+- `cause`（仅状态变化时非空）：`type` + `version`，
+  - `nms_suppressed`：目标的所有候选框都被 NMS 抑制。给出被抑制的
+    `prediction_ids` 和抑制它们的 `suppressed_by_prediction_ids`。
+  - `gt_competition`：目标有保留候选框，但在贪心匹配中先被其他真值占用。
+    给出保留候选框 `prediction_ids` 与其实际配上的 `competing_gt_ids`。
+  - `no_coverage`：没有任何预测框与该真值 IoU 达 0.5。`prediction_ids` 为空。
+  - `version`：`hit_to_missed` 取 `upgraded`（新漏检为何发生）；
+    `missed_to_hit` 取 `baseline`（原漏检源自何处）。
+  - 另附 `nearest_prediction_id` / `nearest_iou`：与该真值 IoU 最大的预测框
+    （含低于 0.5 者），用于定位“最近但还不够”的框。
+- 顶层 `baseline` / `upgraded`: 两版整体 NMS+匹配明细，字段与 `/review`
+  的 `baseline` 相同；`changed_target_count`、`hit_to_missed_gt_ids`、
+  `missed_to_hit_gt_ids` 汇总变化；`targets` 按真值编号升序且去重。
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/review/attribution \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_attribution.json
+```
+
+关键响应（完整字段略）：
+
+```json
+{
+  "targets": [
+    {
+      "gt_id": 102,
+      "changed": true,
+      "change": "hit_to_missed",
+      "baseline": {"status": "hit", "matched_prediction_id": 2,
+                   "candidates": [{"prediction_id": 2, "nms_status": "kept", "matched_gt_id": 102}]},
+      "upgraded": {"status": "missed", "matched_prediction_id": null,
+                   "candidates": [{"prediction_id": 2, "nms_status": "suppressed",
+                                   "suppressed_by_prediction_id": 9, "suppression_iou": 0.555556}]},
+      "cause": {"type": "nms_suppressed", "version": "upgraded",
+                "prediction_ids": [2], "suppressed_by_prediction_ids": [9]}
+    }
+  ]
+}
+```
+
 ## 实现说明
 
 - 核心逻辑在 `app/solver.py`：先一次性预计算预测框两两 IoU 与预测框-真值 IoU
   矩阵，再对候选对的每个子集（≤2¹⁰）重放 NMS+匹配，按豁免对数从小到大找到
   第一个可行子集即为最优解；无解时用「全部豁免」的结果生成诊断说明。
+- 版本归因复用同一套 `evaluate` 重放：两版各自独立计算 IoU 矩阵并重放，
+  再从结果中提取逐目标候选状态。原因判定顺序为：无 IoU ≥ 0.5 候选 →
+  `no_coverage`；有候选但全部被抑制 → `nms_suppressed`；有保留候选 →
+  `gt_competition`。`/review` 的行为与响应未改动。
 - 校验在 `app/models.py`（Pydantic）：数量上限、框合法性、编号唯一、
   目标真值与豁免对端点必须存在等，不合法请求返回 422 及中文错误信息。
-- 测试在 `tests/`（35 个用例）：IoU 边界、严格大于阈值才抑制、只有保留框能
+- 测试在 `tests/`（59 个用例）：IoU 边界、严格大于阈值才抑制、只有保留框能
   抑制、分数/IoU 并列取小编号、匹配下限 0.5 含等号、级联需两对豁免、原有命中
-  丢失判无解、误报不增约束、无效候选对忽略、API 端到端与全部 422 分支。
+  丢失判无解、误报不增约束、无效候选对忽略、版本归因三类原因与往返变化、
+  API 端到端与全部 422 分支。

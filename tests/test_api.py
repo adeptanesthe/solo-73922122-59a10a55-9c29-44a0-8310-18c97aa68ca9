@@ -156,3 +156,225 @@ def test_threshold_out_of_range_rejected():
     payload = copy.deepcopy(SOLVED_PAYLOAD)
     payload["iou_threshold"] = 1.2
     assert post(payload).status_code == 422
+
+
+# ---------------- 版本归因 /api/v1/review/attribution ----------------
+
+ATTRIBUTION_PAYLOAD = {
+    "ground_truths": [
+        {"id": 101, "box": [50, 50, 70, 70]},
+        {"id": 102, "box": [0, 0, 10, 10]},
+    ],
+    "iou_threshold": 0.5,
+    "target_gt_ids": [101, 102],
+    "baseline_predictions": [
+        {"id": 1, "box": [50, 50, 70, 70], "score": 0.90},
+        {"id": 2, "box": [0, 0, 10, 20], "score": 0.80},
+    ],
+    # 升级版新增高置信框 9，抑制了 2 → GT102 新出现漏检
+    "upgraded_predictions": [
+        {"id": 1, "box": [50, 50, 70, 70], "score": 0.90},
+        {"id": 2, "box": [0, 0, 10, 20], "score": 0.80},
+        {"id": 9, "box": [0, 9, 10, 20], "score": 0.95},
+    ],
+}
+
+
+def post_attr(payload):
+    return client.post("/api/v1/review/attribution", json=payload)
+
+
+def test_attribution_nms_suppressed_end_to_end():
+    resp = post_attr(ATTRIBUTION_PAYLOAD)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["changed_target_count"] == 1
+    assert body["hit_to_missed_gt_ids"] == [102]
+    assert body["missed_to_hit_gt_ids"] == []
+    t = {x["gt_id"]: x for x in body["targets"]}[102]
+    assert t["changed"] is True
+    assert t["change"] == "hit_to_missed"
+    assert t["baseline"]["status"] == "hit"
+    assert t["upgraded"]["status"] == "missed"
+    assert t["baseline"]["matched_prediction_id"] == 2
+    assert t["upgraded"]["matched_prediction_id"] is None
+    assert t["cause"]["type"] == "nms_suppressed"
+    assert t["cause"]["version"] == "upgraded"
+    assert t["cause"]["prediction_ids"] == [2]
+    assert t["cause"]["suppressed_by_prediction_ids"] == [9]
+    cand = t["upgraded"]["candidates"][0]
+    assert cand == {
+        "prediction_id": 2,
+        "iou": cand["iou"],
+        "nms_status": "suppressed",
+        "suppressed_by_prediction_id": 9,
+        "suppression_iou": cand["suppression_iou"],
+        "matched_gt_id": None,
+    }
+    # 未变化目标不带原因
+    t101 = {x["gt_id"]: x for x in body["targets"]}[101]
+    assert t101["change"] == "unchanged"
+    assert t101["cause"] is None
+    # 两版整体明细仍沿用 /review 的框格式
+    assert body["baseline"]["kept_prediction_ids"] == [1, 2]
+    assert body["upgraded"]["kept_prediction_ids"] == [9, 1]
+    assert body["upgraded"]["suppressed"] == [
+        {"prediction_id": 2, "suppressed_by": 9, "iou": body["upgraded"]["suppressed"][0]["iou"]}
+    ]
+
+
+def test_attribution_gt_competition_end_to_end():
+    payload = {
+        "ground_truths": [
+            {"id": 101, "box": [0, 0, 20, 20]},
+            {"id": 102, "box": [10, 0, 30, 20]},
+        ],
+        "iou_threshold": 0.5,
+        "target_gt_ids": [102],
+        "baseline_predictions": [
+            {"id": 1, "box": [0, 0, 20, 20], "score": 0.9},
+            {"id": 3, "box": [10, 0, 30, 20], "score": 0.8},
+        ],
+        "upgraded_predictions": [
+            {"id": 2, "box": [5, 0, 25, 20], "score": 0.95},
+        ],
+    }
+    body = post_attr(payload).json()
+    t = body["targets"][0]
+    assert t["change"] == "hit_to_missed"
+    assert t["cause"]["type"] == "gt_competition"
+    assert t["cause"]["prediction_ids"] == [2]
+    assert t["cause"]["competing_gt_ids"] == [101]
+    assert t["upgraded"]["candidates"][0]["nms_status"] == "kept"
+    assert t["upgraded"]["candidates"][0]["matched_gt_id"] == 101
+
+
+def test_attribution_no_coverage_end_to_end():
+    payload = {
+        "ground_truths": [{"id": 7, "box": [100, 100, 120, 120]}],
+        "iou_threshold": 0.5,
+        "target_gt_ids": [7],
+        "baseline_predictions": [
+            {"id": 4, "box": [100, 100, 120, 120], "score": 0.7},
+        ],
+        "upgraded_predictions": [
+            {"id": 5, "box": [0, 0, 20, 20], "score": 0.9},
+        ],
+    }
+    body = post_attr(payload).json()
+    t = body["targets"][0]
+    assert t["change"] == "hit_to_missed"
+    assert t["cause"]["type"] == "no_coverage"
+    assert t["cause"]["prediction_ids"] == []
+    assert t["cause"]["nearest_prediction_id"] == 5
+    assert t["upgraded"]["candidates"] == []
+
+
+def test_attribution_missed_to_hit_end_to_end():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["baseline_predictions"], payload["upgraded_predictions"] = (
+        payload["upgraded_predictions"], payload["baseline_predictions"],
+    )
+    body = post_attr(payload).json()
+    assert body["missed_to_hit_gt_ids"] == [102]
+    t = {x["gt_id"]: x for x in body["targets"]}[102]
+    assert t["change"] == "missed_to_hit"
+    assert t["cause"]["version"] == "baseline"
+    assert t["cause"]["type"] == "nms_suppressed"
+
+
+def test_attribution_targets_sorted_and_deduped():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["target_gt_ids"] = [102, 101, 102]
+    body = post_attr(payload).json()
+    assert [t["gt_id"] for t in body["targets"]] == [101, 102]
+
+
+def test_review_unchanged_by_attribution_route():
+    body = post(SOLVED_PAYLOAD).json()
+    assert body["status"] == "solved"
+    assert body["min_exemption_count"] == 1
+    assert body["chosen_exempt_pairs"] == [[1, 2]]
+
+
+# ---------------- 归因入参校验（422） ----------------
+
+def test_attribution_too_many_predictions_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["upgraded_predictions"] = [
+        {"id": i, "box": [i * 10, 0, i * 10 + 5, 5], "score": 0.5}
+        for i in range(121)
+    ]
+    assert post_attr(payload).status_code == 422
+
+
+def test_attribution_allows_120_boxes():
+    payload = {
+        "ground_truths": [{"id": 1000, "box": [0, 0, 2, 2]}],
+        "iou_threshold": 0.5,
+        "target_gt_ids": [1000],
+        "baseline_predictions": [
+            {"id": i, "box": [i * 10, 0, i * 10 + 2, 2], "score": 0.5}
+            for i in range(120)
+        ],
+        "upgraded_predictions": [
+            {"id": i, "box": [i * 10, 0, i * 10 + 2, 2], "score": 0.5}
+            for i in range(120)
+        ],
+    }
+    assert post_attr(payload).status_code == 200
+
+
+def test_attribution_too_many_ground_truths_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["ground_truths"] = [
+        {"id": i, "box": [i * 10, 0, i * 10 + 5, 5]} for i in range(121)
+    ]
+    payload["target_gt_ids"] = [0]
+    assert post_attr(payload).status_code == 422
+
+
+def test_attribution_unknown_target_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["target_gt_ids"] = [999]
+    resp = post_attr(payload)
+    assert resp.status_code == 422
+    assert "999" in resp.text
+
+
+def test_attribution_empty_targets_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["target_gt_ids"] = []
+    assert post_attr(payload).status_code == 422
+
+
+def test_attribution_duplicate_prediction_ids_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["baseline_predictions"].append(
+        {"id": 1, "box": [0, 0, 5, 5], "score": 0.1})
+    assert post_attr(payload).status_code == 422
+
+
+def test_attribution_duplicate_gt_ids_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["ground_truths"].append({"id": 101, "box": [0, 0, 5, 5]})
+    assert post_attr(payload).status_code == 422
+
+
+def test_attribution_degenerate_box_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["upgraded_predictions"][0]["box"] = [10, 10, 10, 20]
+    assert post_attr(payload).status_code == 422
+
+
+def test_attribution_threshold_out_of_range_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    payload["iou_threshold"] = -0.1
+    assert post_attr(payload).status_code == 422
+
+
+def test_attribution_missing_version_rejected():
+    payload = copy.deepcopy(ATTRIBUTION_PAYLOAD)
+    del payload["upgraded_predictions"]
+    assert post_attr(payload).status_code == 422
+

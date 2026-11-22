@@ -44,6 +44,60 @@ class EvalResult:
 
 
 @dataclass
+class CandidateState:
+    """某个真值的一个候选预测框在某一版本重放中的状态。"""
+
+    prediction_id: int
+    iou: float                               # 该框与目标的 IoU（≥ MATCH_IOU_FLOOR）
+    nms_status: str                          # "kept" | "suppressed"
+    suppressed_by_prediction_id: int | None  # NMS 抑制者（保留框）
+    suppression_iou: float | None            # 与抑制者的 IoU
+    matched_gt_id: int | None                # 保留框最终配上的真值（可为其他真值）
+
+
+@dataclass
+class TargetVersionState:
+    """指定真值在某一版本重放中的命中状态与候选框明细。"""
+
+    status: str                              # "hit" | "missed"
+    matched_prediction_id: int | None        # 命中该真值的保留框
+    candidates: list[CandidateState]         # IoU ≥ 0.5 的候选框，按 IoU 降序、编号升序
+
+
+@dataclass
+class CauseInfo:
+    """一次「漏检」的原因归因。"""
+
+    type: str                                # "nms_suppressed" | "gt_competition" | "no_coverage"
+    version: str                             # "baseline" | "upgraded"：原因取自哪一版的重放
+    prediction_ids: list[int]                # 与原因对应的预测框编号
+    suppressed_by_prediction_ids: list[int]  # NMS 原因：抑制这些候选框的保留框编号
+    competing_gt_ids: list[int]              # 竞争原因：保留框实际配上的其他真值编号
+    nearest_prediction_id: int | None        # 全局 IoU 最大的预测框（含低于匹配下限的）
+    nearest_iou: float | None
+    description: str
+
+
+@dataclass
+class TargetAttribution:
+    """单个目标真值在两版重放之间的状态与变化原因。"""
+
+    gt_id: int
+    baseline: TargetVersionState
+    upgraded: TargetVersionState
+    changed: bool
+    change: str                              # "unchanged" | "hit_to_missed" | "missed_to_hit"
+    cause: CauseInfo | None
+
+
+@dataclass
+class AttributionResult:
+    targets: list[TargetAttribution]
+    baseline: EvalResult
+    upgraded: EvalResult
+
+
+@dataclass
 class SolveResult:
     status: str                                # "solved" | "infeasible"
     baseline: EvalResult                       # 无豁免时的结果
@@ -69,6 +123,21 @@ def iou(a: tuple[float, float, float, float],
     area_b = (b[2] - b[0]) * (b[3] - b[1])
     union = area_a + area_b - inter
     return inter / union if union > 0.0 else 0.0
+
+
+def _iou_matrices(
+    preds: list[Prediction], gts: list[GroundTruth]
+) -> tuple[list[list[float]], list[list[float]]]:
+    """预计算预测框两两 IoU 与预测框-真值 IoU 矩阵。"""
+    n, m = len(preds), len(gts)
+    pp_iou = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            v = iou(preds[i].box, preds[j].box)
+            pp_iou[i][j] = v
+            pp_iou[j][i] = v
+    pg_iou = [[iou(preds[i].box, gts[g].box) for g in range(m)] for i in range(n)]
+    return pp_iou, pg_iou
 
 
 def evaluate(
@@ -140,6 +209,169 @@ def is_feasible(res: EvalResult, required_hits: set[int], max_fp: int) -> bool:
     return required_hits <= set(res.hit_gt_ids) and len(res.false_positive_ids) <= max_fp
 
 
+def _version_state(
+    res: EvalResult,
+    gt_id: int,
+    preds: list[Prediction],
+    pg_iou: list[list[float]],
+    gt_index: dict[int, int],
+) -> TargetVersionState:
+    """从一次重放结果中提取指定真值的命中状态与候选框明细。"""
+    g = gt_index[gt_id]
+    matched_by_pid = {pid: gid for pid, gid, _ in res.matches}
+    suppressed_by = {pid: (by, v) for pid, by, v in res.suppressed}
+    matched_pid = next((pid for pid, gid in matched_by_pid.items() if gid == gt_id), None)
+
+    candidates: list[CandidateState] = []
+    for i, pred in enumerate(preds):
+        ov = pg_iou[i][g]
+        if ov < MATCH_IOU_FLOOR:  # 与匹配规则一致：IoU ≥ 0.5 才算该真值的候选
+            continue
+        if pred.id in suppressed_by:
+            by, by_iou = suppressed_by[pred.id]
+            candidates.append(CandidateState(
+                prediction_id=pred.id, iou=ov, nms_status="suppressed",
+                suppressed_by_prediction_id=by, suppression_iou=by_iou,
+                matched_gt_id=matched_by_pid.get(pred.id),
+            ))
+        else:
+            candidates.append(CandidateState(
+                prediction_id=pred.id, iou=ov, nms_status="kept",
+                suppressed_by_prediction_id=None, suppression_iou=None,
+                matched_gt_id=matched_by_pid.get(pred.id),
+            ))
+    candidates.sort(key=lambda c: (-c.iou, c.prediction_id))
+
+    return TargetVersionState(
+        status="hit" if matched_pid is not None else "missed",
+        matched_prediction_id=matched_pid,
+        candidates=candidates,
+    )
+
+
+def _nearest_prediction(
+    preds: list[Prediction], pg_iou: list[list[float]], g: int
+) -> tuple[int | None, float | None]:
+    """全局 IoU 最大的预测框（含低于匹配下限者）；并列取编号较小者。"""
+    if not preds:
+        return None, None
+    best = min(range(len(preds)), key=lambda i: (-pg_iou[i][g], preds[i].id))
+    return preds[best].id, pg_iou[best][g]
+
+
+def _cause(
+    gt_id: int,
+    state: TargetVersionState,
+    version: str,
+    preds: list[Prediction],
+    pg_iou: list[list[float]],
+    gt_index: dict[int, int],
+) -> CauseInfo:
+    """按候选框状态区分三类漏检原因：NMS 抑制 / 与其他真值竞争 / 无覆盖。"""
+    nearest_pid, nearest_ov = _nearest_prediction(preds, pg_iou, gt_index[gt_id])
+    version_name = "基线版" if version == "baseline" else "升级版"
+
+    kept = [c for c in state.candidates if c.nms_status == "kept"]
+    if not kept:
+        if state.candidates:
+            sup_ids = [c.prediction_id for c in state.candidates]
+            by_ids = sorted({c.suppressed_by_prediction_id for c in state.candidates})
+            return CauseInfo(
+                type="nms_suppressed",
+                version=version,
+                prediction_ids=sup_ids,
+                suppressed_by_prediction_ids=by_ids,
+                competing_gt_ids=[],
+                nearest_prediction_id=nearest_pid,
+                nearest_iou=nearest_ov,
+                description=(
+                    f"{version_name}中真值 {gt_id} 的候选框 {sup_ids} 均被 NMS 抑制"
+                    f"（抑制者 {by_ids}），没有保留框可再参与匹配。"
+                ),
+            )
+        return CauseInfo(
+            type="no_coverage",
+            version=version,
+            prediction_ids=[],
+            suppressed_by_prediction_ids=[],
+            competing_gt_ids=[],
+            nearest_prediction_id=nearest_pid,
+            nearest_iou=nearest_ov,
+            description=(
+                f"{version_name}没有任何预测框与真值 {gt_id} 的 IoU 达到匹配下限 "
+                f"{MATCH_IOU_FLOOR}"
+                + (f"（最大 IoU {nearest_ov:.6f}，来自框 {nearest_pid}）。"
+                   if nearest_ov is not None else "（没有预测框）。")
+            ),
+        )
+
+    # 有保留候选框却仍未命中：这些框在贪心匹配中已被其他真值占用
+    kept_pids = [c.prediction_id for c in kept]
+    competing = sorted({c.matched_gt_id for c in kept if c.matched_gt_id is not None})
+    if competing:
+        competition_text = f"真值 {competing} 占用"
+    else:
+        competition_text = "其他真值占用或其余框未达匹配下限"
+    return CauseInfo(
+        type="gt_competition",
+        version=version,
+        prediction_ids=kept_pids,
+        suppressed_by_prediction_ids=[],
+        competing_gt_ids=competing,
+        nearest_prediction_id=nearest_pid,
+        nearest_iou=nearest_ov,
+        description=(
+            f"{version_name}中真值 {gt_id} 的保留候选框 {kept_pids} "
+            f"在贪心匹配中先被{competition_text}，未轮到该真值。"
+        ),
+    )
+
+
+def attribute(
+    gts: list[GroundTruth],
+    target_gt_ids: list[int],
+    iou_threshold: float,
+    baseline_preds: list[Prediction],
+    upgraded_preds: list[Prediction],
+) -> AttributionResult:
+    """在两版抑制前预测框上重放同一套 NMS+匹配，逐目标归因状态变化。
+
+    两版共享同一份真值、NMS 阈值与编号规则；各版本独立重放，互不影响。
+    命中 → 漏检：原因取自升级版重放（新出现的漏检为何发生）；
+    漏检 → 命中：原因取自基线版重放（原先的漏检源自何处，参照 /review 的 MVP 思路）。
+    """
+    pp_base, pg_base = _iou_matrices(baseline_preds, gts)
+    pp_up, pg_up = _iou_matrices(upgraded_preds, gts)
+    base_res = evaluate(baseline_preds, gts, iou_threshold, frozenset(), pp_base, pg_base)
+    up_res = evaluate(upgraded_preds, gts, iou_threshold, frozenset(), pp_up, pg_up)
+    gt_index = {g.id: i for i, g in enumerate(gts)}
+
+    targets: list[TargetAttribution] = []
+    for gt_id in sorted({int(t) for t in target_gt_ids}):
+        base_state = _version_state(base_res, gt_id, baseline_preds, pg_base, gt_index)
+        up_state = _version_state(up_res, gt_id, upgraded_preds, pg_up, gt_index)
+        cause: CauseInfo | None = None
+        if base_state.status == up_state.status:
+            changed, change = False, "unchanged"
+        elif base_state.status == "hit":
+            changed, change = True, "hit_to_missed"
+            cause = _cause(gt_id, up_state, "upgraded", upgraded_preds, pg_up, gt_index)
+        else:
+            changed, change = True, "missed_to_hit"
+            cause = _cause(
+                gt_id, base_state, "baseline", baseline_preds, pg_base, gt_index)
+        targets.append(TargetAttribution(
+            gt_id=gt_id,
+            baseline=base_state,
+            upgraded=up_state,
+            changed=changed,
+            change=change,
+            cause=cause,
+        ))
+
+    return AttributionResult(targets=targets, baseline=base_res, upgraded=up_res)
+
+
 def solve(
     preds: list[Prediction],
     gts: list[GroundTruth],
@@ -152,13 +384,7 @@ def solve(
 
     # 预计算 IoU 矩阵，避免在子集枚举中重复计算
     n, m = len(preds), len(gts)
-    pp_iou = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            v = iou(preds[i].box, preds[j].box)
-            pp_iou[i][j] = v
-            pp_iou[j][i] = v
-    pg_iou = [[iou(preds[i].box, gts[g].box) for g in range(m)] for i in range(n)]
+    pp_iou, pg_iou = _iou_matrices(preds, gts)
 
     idx_of = {p.id: i for i, p in enumerate(preds)}
 

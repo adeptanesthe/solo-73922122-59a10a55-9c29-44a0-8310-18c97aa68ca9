@@ -1,0 +1,17 @@
+{
+  "ground_truths": [
+    {"id": 101, "box": [50, 50, 70, 70]},
+    {"id": 102, "box": [0, 0, 10, 10]}
+  ],
+  "iou_threshold": 0.5,
+  "target_gt_ids": [101, 102],
+  "baseline_predictions": [
+    {"id": 1, "box": [50, 50, 70, 70], "score": 0.90},
+    {"id": 2, "box": [0, 0, 10, 20], "score": 0.80}
+  ],
+  "upgraded_predictions": [
+    {"id": 1, "box": [50, 50, 70, 70], "score": 0.90},
+    {"id": 2, "box": [0, 0, 10, 20], "score": 0.80},
+    {"id": 9, "box": [0, 9, 10, 20], "score": 0.95}
+  ]
+}
